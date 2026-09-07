@@ -747,7 +747,11 @@ class OstrisLinearLayerMemoryManager(BaseLayerMemoryManager):
                     continue
                 if buf.device.type != "cpu":
                     buf = buf.to("cpu")
-                if torch.cuda.is_available() and not buf.is_pinned():
+                if (
+                    torch.cuda.is_available()
+                    and not buf.is_pinned()
+                    and not NO_PIN_MEMORY
+                ):
                     try:
                         buf = buf.pin_memory()
                     except RuntimeError:

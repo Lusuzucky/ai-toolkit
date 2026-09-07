@@ -1894,7 +1894,23 @@ class BaseSDTrainProcess(BaseTrainProcess):
             else:
                 text_encoder.requires_grad_(False)
                 text_encoder.eval()
-        unet.to(self.device_torch, dtype=dtype)
+        # Quantized (fp8/ostris) weights must stay quantized: upcasting them to
+        # the train dtype (e.g. bf16) here materializes a full-size weight copy
+        # on the GPU (~2 bytes/param) that cannot fit low-VRAM cards. OstrisLinear
+        # dequantizes per layer inside forward(), so only the device move applies.
+        fp8_dtypes = (
+            torch.float8_e4m3fn,
+            torch.float8_e4m3fnuz,
+            torch.float8_e5m2,
+            torch.float8_e5m2fnuz,
+        )
+        unet_has_quantized_weights = any(
+            getattr(m, "is_ostris_quantized", False) for m in unet.modules()
+        ) or any(p.dtype in fp8_dtypes for p in unet.parameters())
+        if unet_has_quantized_weights:
+            unet.to(self.device_torch)
+        else:
+            unet.to(self.device_torch, dtype=dtype)
         unet.requires_grad_(False)
         unet.eval()
         if vae is not None:
@@ -1976,7 +1992,6 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     base_model=self.sd,
                     **network_kwargs
                 )
-
 
                 # todo switch everything to proper mixed precision like this
                 self.network.force_to(self.device_torch, dtype=torch.float32)

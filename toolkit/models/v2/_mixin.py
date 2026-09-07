@@ -290,10 +290,16 @@ class OstrisModelMixin:
                 # LM linears + int8 embeddings). The request matches when the
                 # requested backend is among the shipped ones — the whole shipped
                 # quantization is then kept exactly as-is.
+                # configs spell the ostris fp8 backend "float8"; its quantizer
+                # records itself as "float8_e4m3fn". Treat them as equal so a
+                # scaled-fp8 checkpoint is kept instead of dequantized.
+                qtype_aliases = {qtype}
+                if qtype == "float8":
+                    qtype_aliases.add("float8_e4m3fn")
                 matches = (
                     qtype is not None
                     and ara_path is None
-                    and qtype in shipped
+                    and bool(qtype_aliases & set(shipped))
                 )
                 if matches:
                     status_fn(

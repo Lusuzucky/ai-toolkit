@@ -85,11 +85,11 @@ config:
         model_kwargs:
           vae_path: "./Krea-2-Raw/vae"
           text_encoder_path: "./Krea-2-Raw/text_encoder"
-          checkpoint_filename: "raw_float8.safetensors"
+          checkpoint_filename: "raw_float8_scaled.safetensors"
         compile: false
         layer_offloading: true
         layer_offloading_text_encoder_percent: 0
-        layer_offloading_transformer_percent: 1
+        layer_offloading_transformer_percent: 0.95
       sample:
         sampler: "flowmatch"
         sample_every: 250

@@ -62,7 +62,7 @@ def quantize_state_dict_to_float8(
     quantized_count = 0
     kept_count = 0
 
-    with safe_open(input_path, framework="pt", device=device) as f:
+    with safe_open(input_path, framework="pt", device=device, backend="pread") as f:
         keys = list(f.keys())
         pbar = tqdm(keys, desc="Quantizing tensors to float8")
 
@@ -73,11 +73,18 @@ def quantize_state_dict_to_float8(
             exclude = should_exclude(k, exclude_patterns)
 
             if is_linear_weight and not exclude:
-                # Convert to float8
+                # Comfy-style scaled-fp8 storage: fp8_e4m3 weight + one fp32
+                # per-tensor scale, flagged by a top-level "scaled_fp8" marker.
+                # Loaders (toolkit.util.comfy_quant_import) wrap these linears
+                # in OstrisLinear, which dequantizes per forward — keeping the
+                # model trainable on low-VRAM cards.
                 max_val = torch.finfo(target_dtype).max
-                clamped = tensor.to(torch.float32).clamp(min=-max_val, max=max_val)
-                q_tensor = clamped.to(target_dtype)
+                w32 = tensor.to(torch.float32)
+                scale = (w32.abs().max() / max_val).clamp(min=1e-12)
+                q_tensor = (w32 / scale).clamp(min=-max_val, max=max_val).to(target_dtype)
+                prefix = k[: -len(".weight")]
                 quantized_dict[k] = q_tensor
+                quantized_dict[f"{prefix}.scale_weight"] = scale.reshape(1).to(torch.float32)
                 quantized_count += 1
             else:
                 # Keep in fallback floating point or original format
@@ -86,6 +93,10 @@ def quantize_state_dict_to_float8(
                 else:
                     quantized_dict[k] = tensor
                 kept_count += 1
+
+    if quantized_count > 0:
+        # marker that tells comfy_quant_import this is a scaled-fp8 checkpoint
+        quantized_dict["scaled_fp8"] = torch.tensor([1], dtype=torch.uint8)
 
     metadata = {
         "quantization_type": "float8_e4m3fn",

@@ -229,6 +229,23 @@ class Krea2Model(QwenImageVAEHolderMixin, BaseModel):
         import gc
         gc.collect()
         flush()
+
+        # comfy/scaled-fp8 imports wrap linears as OstrisLinear but do not
+        # record a qtype alias; flag pure-fp8 imports so aitk_post_load keeps
+        # the shipped quantization instead of dequantizing to full precision
+        # (which would need a full-size bf16 copy and blows the RAM budget).
+        if getattr(transformer, "aitk_is_quantized", False) and not getattr(
+            transformer, "aitk_qtype", None
+        ):
+            from toolkit.util.ostris_quant import OstrisLinear
+
+            shipped = {
+                getattr(m.ostris_quantizer, "qtype", None)
+                for m in transformer.modules()
+                if isinstance(m, OstrisLinear)
+            } - {None}
+            if shipped and shipped <= {"float8_e4m3fn"}:
+                transformer.aitk_qtype = "float8"
         return transformer
 
     def _load_text_encoder(self):

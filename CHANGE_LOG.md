@@ -172,3 +172,21 @@ config:
   - 由于跳过了 TE 与 VAE，且模型权重通过 mmap 不做物理克隆，训练期间 Python **物理内存常驻占用维持在 2.5GB~3.5GB 左右**，远低于 11.5GB 的剩余上限。
 - **显存 (VRAM)**：
   - 仅加载单层/流水线深度的 Layer 到显存进行计算，结合 `gradient_checkpointing` 与 `adamw8bit`，显存占用稳定在 8GB~12GB（在 15GB 可用显存内从容运行）。
+
+### 四、 2026-09-07 联调记录：FP8 LoRA 训练在 16G 内存 + 16G 显存 Windows 上跑通
+
+本轮定位并修复了 4 个相互独立的阻塞点（此前观察到的"段错误 / CUDA OOM / Job process exited unexpectedly"均由它们引起）：
+
+1. **safetensors mmap 后端在 Windows 上占用 Commit**（量化 24.5GB raw 文件时段错误；18GB 文件直接报"页面文件太小"1455）
+   - 修复：`quantize_model.py` 改用 `backend="pread"` 按需读取，不再映射整个文件（与 Linux mmap 等效但避开 Commit 上限）。
+2. **预量化 FP8 权重被全量上转 BF16**（`unet.to(cuda, dtype=bf16)` 需要 ~27GB 显存，必然 OOM）
+   - 修复：`BaseSDTrainProcess.py` 检测到 ostris/fp8 量化模型时只做 device 移动、跳过 dtype 上转；权重由 OstrisLinear 每层前向解量化（W8A16），这正是 8G 显存 Linux 能跑 int8 的同一套机制。
+3. **原生裸 FP8 文件无法前向计算**（torch 不支持 fp8 直接 matmul；无 scale 直转精度也差）
+   - 修复：`quantize_model.py` 改输出 **comfy scaled-fp8 格式**（fp8 权重 + fp32 per-tensor scale + 顶层 `scaled_fp8` 标记），加载时由 `comfy_quant_import` 自动包成 OstrisLinear；
+   - 配套：`_mixin.py` 将配置名 `float8` 与后端名 `float8_e4m3fn` 视为等价（避免误走"解量化回全精度"分支导致内存爆炸）；`krea2.py` 对纯 fp8 导入补记 `aitk_qtype="float8"`。
+4. **13GB 量化 buffer 被全部 pin_memory() 锁页**（16GB 物理内存被系统占用 + 锁页挤爆，锁页失败以 cudaErrorMemoryAllocation 形式抛出，伪装成"显存 OOM"）
+   - 修复：`manager_modules.py` 的 OstrisLinear pin 循环尊重既有开关 `AI_TOOLKIT_NO_PIN_MEMORY=1`。
+
+验证结果：量化（224 层 fp8 + 206 层 bf16 → `raw_float8_scaled.safetensors`，13.5GB）→ 加载 → LoRA(rank 32) 创建 → 训练迭代全部正常：~14s/step、loss 正常收敛、显存峰值 ~8.8GB/16GB。启动命令：
+
+    AI_TOOLKIT_NO_PIN_MEMORY=1 uv run python run.py my_train.yaml
