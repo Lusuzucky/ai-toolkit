@@ -1425,32 +1425,38 @@ class BaseModel:
     def save_device_state(self):
         # saves the current device state for all modules
         # this is useful for when we want to alter the state and restore it
-        unet_has_grad = self.get_model_has_grad()
+        unet_has_grad = self.get_model_has_grad() if (self.unet is not None and hasattr(self, 'get_model_has_grad')) else False
 
         self.device_state = {
             **empty_preset,
             'vae': {
-                'training': self.vae.training,
-                'device': self.vae.device,
+                'training': self.vae.training if self.vae is not None else False,
+                'device': self.vae.device if self.vae is not None else 'cpu',
             },
             'unet': {
-                'training': self.unet.training,
-                'device': self.unet.device,
+                'training': self.unet.training if self.unet is not None else False,
+                'device': self.unet.device if self.unet is not None else 'cpu',
                 'requires_grad': unet_has_grad,
             },
         }
-        if isinstance(self.text_encoder, list):
+        if self.text_encoder is None:
+            self.device_state['text_encoder'] = {
+                'training': False,
+                'device': 'cpu',
+                'requires_grad': False,
+            }
+        elif isinstance(self.text_encoder, list):
             self.device_state['text_encoder']: List[dict] = []
             for encoder in self.text_encoder:
-                te_has_grad = self.get_te_has_grad()
+                te_has_grad = self.get_te_has_grad() if hasattr(self, 'get_te_has_grad') else False
                 self.device_state['text_encoder'].append({
-                    'training': encoder.training,
-                    'device': encoder.device,
+                    'training': encoder.training if encoder is not None else False,
+                    'device': encoder.device if encoder is not None else 'cpu',
                     # todo there has to be a better way to do this
                     'requires_grad': te_has_grad
                 })
         else:
-            te_has_grad = self.get_te_has_grad()
+            te_has_grad = self.get_te_has_grad() if hasattr(self, 'get_te_has_grad') else False
 
             self.device_state['text_encoder'] = {
                 'training': self.text_encoder.training,
@@ -1460,7 +1466,7 @@ class BaseModel:
         if self.adapter is not None:
             if isinstance(self.adapter, IPAdapter):
                 requires_grad = self.adapter.image_proj_model.training
-                adapter_device = self.unet.device
+                adapter_device = self.unet.device if self.unet is not None else self.device_torch
             elif isinstance(self.adapter, T2IAdapter):
                 requires_grad = self.adapter.adapter.conv_in.weight.requires_grad
                 adapter_device = self.adapter.device
@@ -1501,46 +1507,49 @@ class BaseModel:
         self.device_state = None
 
     def set_device_state(self, state):
-        if state['vae']['training']:
-            self.vae.train()
-        else:
-            self.vae.eval()
-        self.vae.to(state['vae']['device'])
-        if state['unet']['training']:
-            self.unet.train()
-        else:
-            self.unet.eval()
-        self.unet.to(state['unet']['device'])
-        if state['unet']['requires_grad']:
-            self.unet.requires_grad_(True)
-        else:
-            self.unet.requires_grad_(False)
-        if isinstance(self.text_encoder, list):
-            for i, encoder in enumerate(self.text_encoder):
-                if isinstance(state['text_encoder'], list):
-                    if state['text_encoder'][i]['training']:
-                        encoder.train()
-                    else:
-                        encoder.eval()
-                    encoder.to(state['text_encoder'][i]['device'])
-                    encoder.requires_grad_(
-                        state['text_encoder'][i]['requires_grad'])
-                else:
-                    if state['text_encoder']['training']:
-                        encoder.train()
-                    else:
-                        encoder.eval()
-                    encoder.to(state['text_encoder']['device'])
-                    encoder.requires_grad_(
-                        state['text_encoder']['requires_grad'])
-        else:
-            if state['text_encoder']['training']:
-                self.text_encoder.train()
+        if self.vae is not None and 'vae' in state:
+            if state['vae']['training']:
+                self.vae.train()
             else:
-                self.text_encoder.eval()
-            self.text_encoder.to(state['text_encoder']['device'])
-            self.text_encoder.requires_grad_(
-                state['text_encoder']['requires_grad'])
+                self.vae.eval()
+            self.vae.to(state['vae']['device'])
+        if self.unet is not None and 'unet' in state:
+            if state['unet']['training']:
+                self.unet.train()
+            else:
+                self.unet.eval()
+            self.unet.to(state['unet']['device'])
+            if state['unet']['requires_grad']:
+                self.unet.requires_grad_(True)
+            else:
+                self.unet.requires_grad_(False)
+        if self.text_encoder is not None and 'text_encoder' in state:
+            if isinstance(self.text_encoder, list):
+                for i, encoder in enumerate(self.text_encoder):
+                    if isinstance(state['text_encoder'], list):
+                        if state['text_encoder'][i]['training']:
+                            encoder.train()
+                        else:
+                            encoder.eval()
+                        encoder.to(state['text_encoder'][i]['device'])
+                        encoder.requires_grad_(
+                            state['text_encoder'][i]['requires_grad'])
+                    else:
+                        if state['text_encoder']['training']:
+                            encoder.train()
+                        else:
+                            encoder.eval()
+                        encoder.to(state['text_encoder']['device'])
+                        encoder.requires_grad_(
+                            state['text_encoder']['requires_grad'])
+            else:
+                if state['text_encoder']['training']:
+                    self.text_encoder.train()
+                else:
+                    self.text_encoder.eval()
+                self.text_encoder.to(state['text_encoder']['device'])
+                self.text_encoder.requires_grad_(
+                    state['text_encoder']['requires_grad'])
 
         if self.adapter is not None:
             self.adapter.to(state['adapter']['device'])
@@ -1572,6 +1581,8 @@ class BaseModel:
             active_modules = ['vae']
         if device_state_preset in ['cache_clip']:
             active_modules = ['clip']
+        if device_state_preset in ['cache_text_encoder']:
+            active_modules = ['text_encoder']
         if device_state_preset in ['generate']:
             active_modules = ['vae', 'unet',
                               'text_encoder', 'adapter', 'refiner_unet']
@@ -1624,9 +1635,12 @@ class BaseModel:
         self.set_device_state(state)
 
     def text_encoder_to(self, *args, **kwargs):
+        if self.text_encoder is None:
+            return
         if isinstance(self.text_encoder, list):
             for encoder in self.text_encoder:
-                encoder.to(*args, **kwargs)
+                if encoder is not None:
+                    encoder.to(*args, **kwargs)
         else:
             self.text_encoder.to(*args, **kwargs)
 

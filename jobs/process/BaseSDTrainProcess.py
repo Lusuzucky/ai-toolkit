@@ -282,6 +282,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
     def sample(self, step=None, is_first=False):
         if not self.accelerator.is_main_process:
             return
+        if getattr(self, 'skip_te_and_vae', False) or getattr(self.sd, 'vae', None) is None or getattr(self.sd, 'text_encoder', None) is None:
+            print_acc("Skipping sample image generation because VAE and Text Encoder are not loaded (pre-cached mode)")
+            return
         flush()
         sample_folder = os.path.join(self.save_root, 'samples')
         gen_img_config_list = []
@@ -746,7 +749,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self.accelerator.even_batches=False
         
         # # prepare all the models stuff for accelerator (hopefully we dont miss any)
-        self.sd.vae = self.accelerator.prepare(self.sd.vae)
+        if self.sd.vae is not None:
+            self.sd.vae = self.accelerator.prepare(self.sd.vae)
         if self.sd.unet is not None:
             self.sd.unet = self.accelerator.prepare(self.sd.unet)
             # todo always tdo it?
@@ -1559,6 +1563,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # caches everything needed for validation (latents, prompt embeds, fixed noise)
         # must be called while the vae and text encoder are still loaded, they may be
         # dumped later to save memory
+        if getattr(self, 'skip_te_and_vae', False) or getattr(self.sd, 'vae', None) is None or getattr(self.sd, 'text_encoder', None) is None:
+            print_acc("Skipping validation setup because VAE and Text Encoder are not loaded (pre-cached mode)")
+            return
         val_config = self.train_config.validation_config
         if val_config is None:
             return
@@ -1759,6 +1766,24 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 model_config_to_load.refiner_name_or_path = previous_refiner_save
                 self.load_training_state_from_metadata(previous_refiner_save)
 
+        # Check if we should skip loading Text Encoder and VAE
+        # Triggered when cache_text_embeddings is True and latents are cached to disk
+        has_cache_te = self.train_config.cache_text_embeddings or self.is_caching_text_embeddings
+        has_cache_latents = bool(self.dataset_configs and all(getattr(ds, 'cache_latents_to_disk', False) for ds in self.dataset_configs))
+        explicit_skip = self.get_conf('train.skip_te_and_vae', None)
+        if explicit_skip is not None:
+            self.skip_te_and_vae = bool(explicit_skip)
+        else:
+            self.skip_te_and_vae = bool(has_cache_te and has_cache_latents)
+
+        if self.skip_te_and_vae:
+            print_acc(" - [Low Memory Mode] cache_text_embeddings and cache_latents_to_disk are active: skipping Text Encoder and VAE loading & quantization.")
+            model_config_to_load.skip_te_and_vae = True
+            model_config_to_load.quantize_te = False
+            if not hasattr(model_config_to_load, "model_kwargs") or model_config_to_load.model_kwargs is None:
+                model_config_to_load.model_kwargs = {}
+            model_config_to_load.model_kwargs['skip_te_and_vae'] = True
+
         self.sd = ModelClass(
             # todo handle single gpu and multi gpu here
             # device=self.device,
@@ -1785,26 +1810,29 @@ class BaseSDTrainProcess(BaseTrainProcess):
         noise_scheduler = self.sd.noise_scheduler
 
         if self.train_config.xformers:
-            vae.enable_xformers_memory_efficient_attention()
+            if vae is not None:
+                vae.enable_xformers_memory_efficient_attention()
             unet.enable_xformers_memory_efficient_attention()
-            if isinstance(text_encoder, list):
-                for te in text_encoder:
-                    # if it has it
-                    if hasattr(te, 'enable_xformers_memory_efficient_attention'):
-                        te.enable_xformers_memory_efficient_attention()
+            if text_encoder is not None:
+                if isinstance(text_encoder, list):
+                    for te in text_encoder:
+                        # if it has it
+                        if hasattr(te, 'enable_xformers_memory_efficient_attention'):
+                            te.enable_xformers_memory_efficient_attention()
         
         if self.train_config.attention_backend != 'native':
-            if hasattr(vae, 'set_attention_backend'):
+            if vae is not None and hasattr(vae, 'set_attention_backend'):
                 vae.set_attention_backend(self.train_config.attention_backend)
             if hasattr(unet, 'set_attention_backend'):
                 unet.set_attention_backend(self.train_config.attention_backend)
-            if isinstance(text_encoder, list):
-                for te in text_encoder:
-                    if hasattr(te, 'set_attention_backend'):
-                        te.set_attention_backend(self.train_config.attention_backend)
-            else:
-                if hasattr(text_encoder, 'set_attention_backend'):
-                    text_encoder.set_attention_backend(self.train_config.attention_backend)
+            if text_encoder is not None:
+                if isinstance(text_encoder, list):
+                    for te in text_encoder:
+                        if hasattr(te, 'set_attention_backend'):
+                            te.set_attention_backend(self.train_config.attention_backend)
+                else:
+                    if hasattr(text_encoder, 'set_attention_backend'):
+                        text_encoder.set_attention_backend(self.train_config.attention_backend)
         if self.train_config.sdp:
             torch.backends.cuda.enable_math_sdp(True)
             torch.backends.cuda.enable_flash_sdp(True)
@@ -1836,17 +1864,18 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 unet.gradient_checkpointing = True
             else:
                 print("Gradient checkpointing not supported on this model")
-            if isinstance(text_encoder, list):
-                for te in text_encoder:
-                    if hasattr(te, 'enable_gradient_checkpointing'):
-                        te.enable_gradient_checkpointing()
-                    if hasattr(te, "gradient_checkpointing_enable"):
-                        te.gradient_checkpointing_enable()
-            else:
-                if hasattr(text_encoder, 'enable_gradient_checkpointing'):
-                    text_encoder.enable_gradient_checkpointing()
-                if hasattr(text_encoder, "gradient_checkpointing_enable"):
-                    text_encoder.gradient_checkpointing_enable()
+            if text_encoder is not None:
+                if isinstance(text_encoder, list):
+                    for te in text_encoder:
+                        if hasattr(te, 'enable_gradient_checkpointing'):
+                            te.enable_gradient_checkpointing()
+                        if hasattr(te, "gradient_checkpointing_enable"):
+                            te.gradient_checkpointing_enable()
+                else:
+                    if hasattr(text_encoder, 'enable_gradient_checkpointing'):
+                        text_encoder.enable_gradient_checkpointing()
+                    if hasattr(text_encoder, "gradient_checkpointing_enable"):
+                        text_encoder.gradient_checkpointing_enable()
 
         if self.sd.refiner_unet is not None:
             self.sd.refiner_unet.to(self.device_torch, dtype=dtype)
@@ -1857,19 +1886,21 @@ class BaseSDTrainProcess(BaseTrainProcess):
             if self.train_config.gradient_checkpointing:
                 self.sd.refiner_unet.enable_gradient_checkpointing()
 
-        if isinstance(text_encoder, list):
-            for te in text_encoder:
-                te.requires_grad_(False)
-                te.eval()
-        else:
-            text_encoder.requires_grad_(False)
-            text_encoder.eval()
+        if text_encoder is not None:
+            if isinstance(text_encoder, list):
+                for te in text_encoder:
+                    te.requires_grad_(False)
+                    te.eval()
+            else:
+                text_encoder.requires_grad_(False)
+                text_encoder.eval()
         unet.to(self.device_torch, dtype=dtype)
         unet.requires_grad_(False)
         unet.eval()
-        vae = vae.to(torch.device('cpu'), dtype=dtype)
-        vae.requires_grad_(False)
-        vae.eval()
+        if vae is not None:
+            vae = vae.to(torch.device('cpu'), dtype=dtype)
+            vae.requires_grad_(False)
+            vae.eval()
         if self.train_config.learnable_snr_gos:
             self.snr_gos = LearnableSNRGamma(
                 self.sd.noise_scheduler, device=self.device_torch

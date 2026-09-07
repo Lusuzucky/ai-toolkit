@@ -296,17 +296,21 @@ class SDTrainer(BaseSDTrainProcess):
         super().hook_before_train_loop()
         if self.is_caching_text_embeddings:
             # make sure model is on cpu for this part so we don't oom.
-            self.sd.unet.to('cpu')
+            if self.sd.unet is not None:
+                self.sd.unet.to('cpu')
         
         # cache unconditional embeds (blank prompt)
-        with torch.no_grad():
-            self.unconditional_embeds = self.encode_static_prompt(
-                [self.train_config.unconditional_prompt],
-                long_prompts=self.do_long_prompts,
-            ).to(
-                self.device_torch,
-                dtype=self.sd.torch_dtype
-            ).detach()
+        if self.sd.text_encoder is not None:
+            with torch.no_grad():
+                uncond = self.encode_static_prompt(
+                    [self.train_config.unconditional_prompt],
+                    long_prompts=self.do_long_prompts,
+                )
+                if uncond is not None:
+                    self.unconditional_embeds = uncond.to(
+                        self.device_torch,
+                        dtype=self.sd.torch_dtype
+                    ).detach()
         
         if self.train_config.do_prior_divergence:
             self.do_prior_prediction = True
@@ -314,13 +318,14 @@ class SDTrainer(BaseSDTrainProcess):
             # D-OPSD: the teacher (prior) prediction is the training target
             self.do_prior_prediction = True
         # move vae to device if we did not cache latents
-        if not self.is_latents_cached:
-            self.sd.vae.eval()
-            self.sd.vae.to(self.device_torch)
-        else:
-            # offload it. Already cached
-            self.sd.vae.to('cpu')
-            flush()
+        if self.sd.vae is not None:
+            if not self.is_latents_cached:
+                self.sd.vae.eval()
+                self.sd.vae.to(self.device_torch)
+            else:
+                # offload it. Already cached
+                self.sd.vae.to('cpu')
+                flush()
         add_all_snr_to_noise_scheduler(self.sd.noise_scheduler, self.device_torch)
         if self.adapter is not None:
             self.adapter.to(self.device_torch)
@@ -352,7 +357,7 @@ class SDTrainer(BaseSDTrainProcess):
                 self.negative_prompt_pool = [self.train_config.negative_prompt]
 
         # handle unload text encoder
-        if self.train_config.unload_text_encoder or self.is_caching_text_embeddings:
+        if (self.train_config.unload_text_encoder or self.is_caching_text_embeddings) and self.sd.text_encoder is not None:
             print_acc("Caching embeddings and unloading text encoder")
             with torch.no_grad():
                 if self.train_config.train_text_encoder:
@@ -1424,15 +1429,16 @@ class SDTrainer(BaseSDTrainProcess):
                 batch = self.adapter.edit_batch_processed(batch)
             dtype = get_torch_dtype(self.train_config.dtype)
             # sanity check
-            if self.sd.vae.dtype != self.sd.vae_torch_dtype:
+            if self.sd.vae is not None and hasattr(self.sd.vae, 'dtype') and self.sd.vae.dtype != self.sd.vae_torch_dtype:
                 self.sd.vae = self.sd.vae.to(self.sd.vae_torch_dtype)
-            if isinstance(self.sd.text_encoder, list):
-                for encoder in self.sd.text_encoder:
-                    if encoder.dtype != self.sd.te_torch_dtype:
-                        encoder.to(self.sd.te_torch_dtype)
-            else:
-                if self.sd.text_encoder.dtype != self.sd.te_torch_dtype:
-                    self.sd.text_encoder.to(self.sd.te_torch_dtype)
+            if self.sd.text_encoder is not None:
+                if isinstance(self.sd.text_encoder, list):
+                    for encoder in self.sd.text_encoder:
+                        if encoder is not None and hasattr(encoder, 'dtype') and encoder.dtype != self.sd.te_torch_dtype:
+                            encoder.to(self.sd.te_torch_dtype)
+                else:
+                    if hasattr(self.sd.text_encoder, 'dtype') and self.sd.text_encoder.dtype != self.sd.te_torch_dtype:
+                        self.sd.text_encoder.to(self.sd.te_torch_dtype)
 
             noisy_latents, noise, timesteps, conditioned_prompts, imgs = self.process_general_training_batch(batch)
             if self.train_config.do_cfg or self.train_config.do_random_cfg:

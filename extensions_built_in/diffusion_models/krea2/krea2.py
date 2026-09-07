@@ -226,6 +226,8 @@ class Krea2Model(QwenImageVAEHolderMixin, BaseModel):
             state_dict, dtype, config=config
         )
         del state_dict
+        import gc
+        gc.collect()
         flush()
         return transformer
 
@@ -234,11 +236,20 @@ class Krea2Model(QwenImageVAEHolderMixin, BaseModel):
         te_path = self.model_config.model_kwargs.get("text_encoder_path", QWEN3_VL_PATH)
         self.print_and_status_update(f"Loading Qwen3-VL text encoder from {te_path}")
 
+        tok_path = te_path
+        if os.path.isdir(te_path) and not os.path.exists(os.path.join(te_path, "tokenizer.json")):
+            parent_dir = os.path.dirname(te_path)
+            candidate_tok = os.path.join(parent_dir, "tokenizer")
+            if os.path.exists(os.path.join(candidate_tok, "tokenizer.json")):
+                tok_path = candidate_tok
+            elif os.path.exists(os.path.join(parent_dir, "tokenizer.json")):
+                tok_path = parent_dir
+
         tokenizer = AutoTokenizer.from_pretrained(
-            te_path, max_length=self.max_text_length, token=HF_TOKEN
+            tok_path, max_length=self.max_text_length, token=HF_TOKEN
         )
         processor = Qwen2TokenizerFast.from_pretrained(
-            te_path, max_length=self.max_text_length, token=HF_TOKEN
+            tok_path, max_length=self.max_text_length, token=HF_TOKEN
         )
         text_encoder = Qwen3VLTextEncoder.load_model(
             te_path, dtype=dtype, subfolder="", token=HF_TOKEN
@@ -248,7 +259,7 @@ class Krea2Model(QwenImageVAEHolderMixin, BaseModel):
             # Edit mode: reference images are encoded into the text embeddings,
             # so the vision tower stays. Swap its Conv3d patch_embed for an
             # equivalent GEMM (bf16 Conv3d has no fast cuDNN kernel).
-            vl_processor = AutoProcessor.from_pretrained(te_path, token=HF_TOKEN)
+            vl_processor = AutoProcessor.from_pretrained(tok_path, token=HF_TOKEN)
             patch_qwen_vl_patch_embed(text_encoder)
         else:
             # We only ever encode text, so the vision tower is dead weight -- drop it to
@@ -373,6 +384,40 @@ class Krea2Model(QwenImageVAEHolderMixin, BaseModel):
         dtype = self.torch_dtype
         self.print_and_status_update("Loading Krea 2 model")
 
+        only_load_vae = getattr(self.model_config, 'only_load_vae', False) or self.model_config.model_kwargs.get("only_load_vae", False)
+        only_load_te = getattr(self.model_config, 'only_load_te', False) or self.model_config.model_kwargs.get("only_load_te", False)
+
+        if only_load_vae:
+            self.print_and_status_update("Only loading VAE for caching")
+            self.model = None
+            self.transformer = None
+            self.text_encoder = None
+            self.tokenizer = None
+            self.processor = None
+            self.vl_processor = None
+            vae = self._load_vae()
+            vae.to(self.vae_device_torch, dtype=self.vae_torch_dtype)
+            self.vae = vae
+            self.noise_scheduler = Krea2Model.get_train_scheduler()
+            self.print_and_status_update("VAE Loaded")
+            return
+
+        if only_load_te:
+            self.print_and_status_update("Only loading Text Encoder for caching")
+            self.model = None
+            self.transformer = None
+            self.vae = None
+            tokenizer, processor, vl_processor, text_encoder = self._load_text_encoder()
+            text_encoder.aitk_post_load(**self.component_load_kwargs("te"))
+            flush()
+            self.tokenizer = tokenizer
+            self.processor = processor
+            self.vl_processor = vl_processor
+            self.text_encoder = text_encoder
+            self.noise_scheduler = Krea2Model.get_train_scheduler()
+            self.print_and_status_update("Text Encoder Loaded")
+            return
+
         transformer = self._load_transformer()
 
         # load assistant lora if specified
@@ -384,14 +429,25 @@ class Krea2Model(QwenImageVAEHolderMixin, BaseModel):
 
         # quantize + offload + placement, all driven by model_config
         transformer.aitk_post_load(**self.component_load_kwargs("transformer"))
+        import gc
+        gc.collect()
         flush()
 
-        tokenizer, processor, vl_processor, text_encoder = self._load_text_encoder()
-        text_encoder.aitk_post_load(**self.component_load_kwargs("te"))
-        flush()
+        skip_te_and_vae = getattr(self.model_config, 'skip_te_and_vae', False) or self.model_config.model_kwargs.get("skip_te_and_vae", False)
+        if skip_te_and_vae:
+            self.print_and_status_update("Skipping Text Encoder and VAE loading (pre-cached mode)")
+            tokenizer = None
+            processor = None
+            vl_processor = None
+            text_encoder = None
+            vae = None
+        else:
+            tokenizer, processor, vl_processor, text_encoder = self._load_text_encoder()
+            text_encoder.aitk_post_load(**self.component_load_kwargs("te"))
+            flush()
 
-        vae = self._load_vae()
-        vae.to(self.vae_device_torch, dtype=self.vae_torch_dtype)
+            vae = self._load_vae()
+            vae.to(self.vae_device_torch, dtype=self.vae_torch_dtype)
 
         self.noise_scheduler = Krea2Model.get_train_scheduler()
 
@@ -638,7 +694,7 @@ class Krea2Model(QwenImageVAEHolderMixin, BaseModel):
         if isinstance(prompt, str):
             prompt = [prompt]
 
-        if self.text_encoder.device == torch.device("cpu"):
+        if self.text_encoder is not None and self.text_encoder.device == torch.device("cpu"):
             self.text_encoder.to(self.device_torch)
 
         # Normalize control images to a per-prompt list (List[List[Tensor]]).

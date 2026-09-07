@@ -1,5 +1,5 @@
 import os
-from typing import List
+from typing import List, Union
 from toolkit.models.base_model import BaseModel
 from toolkit.stable_diffusion_model import StableDiffusion
 from toolkit.config_modules import ModelConfig
@@ -58,17 +58,18 @@ LEGACY_ARCHS = {
 }
 
 
-def get_model_class(config: ModelConfig):
+def get_model_class(config: Union[ModelConfig, str]):
+    arch = config.arch if hasattr(config, "arch") else config
     all_models = get_all_models()
     for ModelClass in all_models:
-        if ModelClass.arch == config.arch:
+        if ModelClass.arch == arch:
             return ModelClass
-    if config.arch in LEGACY_ARCHS:
+    if arch in LEGACY_ARCHS:
         return StableDiffusion
     # a typo'd or unregistered arch used to silently fall back to SD1; error
     # instead (a broken extension import also lands here — its error was
     # printed during get_all_models)
     known = sorted({m.arch for m in all_models if m.arch} | LEGACY_ARCHS)
     raise ValueError(
-        f"Unknown model arch {config.arch!r}. Known archs: {', '.join(known)}"
+        f"Unknown model arch {arch!r}. Known archs: {', '.join(known)}"
     )

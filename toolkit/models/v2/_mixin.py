@@ -264,53 +264,60 @@ class OstrisModelMixin:
         # requested (full finetuning), a different backend, or an ARA —
         # restores/requantizes to what was asked for.
         if getattr(self, "aitk_is_quantized", False):
-            from toolkit.util.ostris_quant import OstrisLinear
-            from toolkit.util.quantize import (
-                dequantize_ostris_to_linear,
-                get_qtype,
-                ostristype,
-            )
-
-            shipped = sorted(
-                {
-                    getattr(m.ostris_quantizer, "qtype", None)
-                    for m in self.modules()
-                    if isinstance(m, OstrisLinear)
-                }
-                - {None}
-            )
-            # a checkpoint may deliberately mix backends (minimax's TE: nvfp4
-            # LM linears + int8 embeddings). The request matches when the
-            # requested backend is among the shipped ones — the whole shipped
-            # quantization is then kept exactly as-is.
-            matches = (
-                qtype is not None
-                and ara_path is None
-                and qtype in shipped
-            )
-            if matches:
-                status_fn(
-                    f"Checkpoint is pre-quantized ({'/'.join(shipped)}); keeping it"
-                )
+            current_qtype = getattr(self, "aitk_qtype", None)
+            # If checkpoint is already float8 quantized and requested qtype is float8/qfloat8, keep it
+            if current_qtype in ("float8", "qfloat8") and (qtype in ("float8", "qfloat8") or qtype is None):
+                status_fn("Checkpoint is already float8 quantized; keeping it and skipping quantization")
             else:
-                target_is_ostris = qtype is not None and isinstance(
-                    get_qtype(qtype), ostristype
+                from toolkit.util.ostris_quant import OstrisLinear
+                from toolkit.util.quantize import (
+                    dequantize_ostris_to_linear,
+                    get_qtype,
+                    ostristype,
                 )
-                if qtype is None or ara_path is not None or not target_is_ostris:
-                    # full precision requested, an ARA (quantizes fresh from
-                    # full weights), or a quanto/torchao backend that cannot
-                    # re-quantize an OstrisLinear: dequantize first
+
+                shipped = sorted(
+                    {
+                        getattr(m.ostris_quantizer, "qtype", None)
+                        for m in self.modules()
+                        if isinstance(m, OstrisLinear)
+                    }
+                    - {None}
+                )
+                if current_qtype and not shipped:
+                    shipped = [current_qtype]
+                # a checkpoint may deliberately mix backends (minimax's TE: nvfp4
+                # LM linears + int8 embeddings). The request matches when the
+                # requested backend is among the shipped ones — the whole shipped
+                # quantization is then kept exactly as-is.
+                matches = (
+                    qtype is not None
+                    and ara_path is None
+                    and qtype in shipped
+                )
+                if matches:
                     status_fn(
-                        f"Dequantizing shipped {'/'.join(shipped)} weights "
-                        f"-> {qtype or 'full precision'}"
+                        f"Checkpoint is pre-quantized ({'/'.join(shipped)}); keeping it"
                     )
-                    dequantize_ostris_to_linear(self)
                 else:
-                    # ostris -> ostris: quantize_module re-quantizes each
-                    # layer in place (dequant -> requant, one layer at a time)
-                    status_fn(f"Requantizing {'/'.join(shipped)} -> {qtype}")
-                self.aitk_is_quantized = False
-                self.aitk_qtype = None
+                    target_is_ostris = qtype is not None and isinstance(
+                        get_qtype(qtype), ostristype
+                    )
+                    if qtype is None or ara_path is not None or not target_is_ostris:
+                        # full precision requested, an ARA (quantizes fresh from
+                        # full weights), or a quanto/torchao backend that cannot
+                        # re-quantize an OstrisLinear: dequantize first
+                        status_fn(
+                            f"Dequantizing shipped {'/'.join(shipped)} weights "
+                            f"-> {qtype or 'full precision'}"
+                        )
+                        dequantize_ostris_to_linear(self)
+                    else:
+                        # ostris -> ostris: quantize_module re-quantizes each
+                        # layer in place (dequant -> requant, one layer at a time)
+                        status_fn(f"Requantizing {'/'.join(shipped)} -> {qtype}")
+                    self.aitk_is_quantized = False
+                    self.aitk_qtype = None
 
         if qtype and not getattr(self, "aitk_is_quantized", False):
             from toolkit.util.quantize import (
@@ -604,15 +611,30 @@ class OstrisModelMixin:
                     if isinstance(m, OstrisLinear) and m.bias is not None:
                         m.bias.data = m.bias.data.to(dtype=dtype)
             model.aitk_is_quantized = True
-        elif cls.aitk_cast_on_load:
-            for key, value in state_dict.items():
-                if value.is_floating_point():
-                    state_dict[key] = value.to(dtype=dtype)
-            model.load_state_dict(state_dict, assign=True)
-            model.to(dtype=dtype)
         else:
-            # stored-precision load (the checkpoint's dtype mix is deliberate)
-            model.load_state_dict(state_dict, assign=True)
+            is_float8_checkpoint = any(
+                isinstance(v, torch.Tensor) and v.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+                for v in state_dict.values()
+            )
+            if is_float8_checkpoint:
+                # Checkpoint contains pre-quantized float8 weights.
+                # Do NOT cast float8 tensors to BF16/FP16! Only cast other floating point tensors.
+                for key, value in state_dict.items():
+                    if isinstance(value, torch.Tensor) and value.is_floating_point():
+                        if value.dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
+                            state_dict[key] = value.to(dtype=dtype)
+                model.load_state_dict(state_dict, assign=True)
+                model.aitk_is_quantized = True
+                model.aitk_qtype = "float8"
+            elif cls.aitk_cast_on_load:
+                for key, value in state_dict.items():
+                    if value.is_floating_point():
+                        state_dict[key] = value.to(dtype=dtype)
+                model.load_state_dict(state_dict, assign=True)
+                model.to(dtype=dtype)
+            else:
+                # stored-precision load (the checkpoint's dtype mix is deliberate)
+                model.load_state_dict(state_dict, assign=True)
         del state_dict
         flush()
         return model

@@ -13,3 +13,6 @@ from .GenerateProcess import GenerateProcess
 from .BaseExtensionProcess import BaseExtensionProcess
 from .TrainESRGANProcess import TrainESRGANProcess
 from .BaseSDTrainProcess import BaseSDTrainProcess
+from .QuantizeModelProcess import QuantizeModelProcess
+from .CacheVAEProcess import CacheVAEProcess
+from .CacheTEProcess import CacheTEProcess
