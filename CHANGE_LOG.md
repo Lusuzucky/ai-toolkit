@@ -1,4 +1,4 @@
-我已经完成了对代码库与相关架构的深入调研，并制定了完整的实施计划。
+_t_e_cache我已经完成了对代码库与相关架构的深入调研，并制定了完整的实施计划。
 
 详细方案请查阅设计文档：[implementation_plan.md](file:///C:/Users/david/.gemini/antigravity/brain/6b5ff252-4119-49ab-839b-a264c4161b3a/implementation_plan.md)。
 
@@ -56,15 +56,15 @@
 ##### 方式 A：通过 Python 命令行调用
 ```powershell
 # 1. 离线缓存 VAE
-python -m toolkit.tools.cache_vae --config "config/train_krea2.yaml"
+uv run python -m toolkit.tools.cache_vae --config "train.yaml"
 
 # 2. 离线缓存 Text Encoder
-python -m toolkit.tools.cache_te --config "config/train_krea2.yaml"
+uv run python -m toolkit.tools.cache_te --config "train.yaml"
 
 # 3. 将原始 Krea2 模型量化为 float8（极低内存占用）
-python -m toolkit.tools.quantize_model `
-  --input "./Krea-2-Raw/raw.safetensors" `
-  --output "./Krea-2-Raw/raw_float8.safetensors" `
+uv run python -m toolkit.tools.quantize_model \
+  --input "/root/krea2/Krea-2-Raw/raw.safetensors" \
+  --output "/root/krea2/Krea-2-Raw/raw_float8.safetensors" \
   --qtype float8
 ```
 
@@ -160,7 +160,7 @@ config:
    $env:AI_TOOLKIT_OFFLOAD_DEPTH="1"
 
    # 3. 启动训练
-   python run.py config/train_krea2.yaml
+   uv run python run.py config/train_krea2.yaml
    ```
 
 ---
@@ -190,3 +190,26 @@ config:
 验证结果：量化（224 层 fp8 + 206 层 bf16 → `raw_float8_scaled.safetensors`，13.5GB）→ 加载 → LoRA(rank 32) 创建 → 训练迭代全部正常：~14s/step、loss 正常收敛、显存峰值 ~8.8GB/16GB。启动命令：
 
     AI_TOOLKIT_NO_PIN_MEMORY=1 uv run python run.py my_train.yaml
+
+---
+
+### 五、 2026-09-08 Krea2 注意力后端切换：cuDNN → FlashAttention-2
+
+**问题**：远程服务器训练时报
+
+    cuDNN SDPA execution failed with error code ["CUDNN_BACKEND_API_FAILED"]:
+    ... err 2 != CUDA_SUCCESS :: shimCuLaunchKernelEx(...)
+    CUDNN_STATUS_EXECUTION_FAILED_CUDA_DRIVER
+    CUDA ran out of memory outside PyTorch's allocator.
+
+**原因**：`mmdit.py` 的 `attention()` 把 `SDPBackend.CUDNN_ATTENTION` 排在 SDPA 优先级第一位。cuDNN 会为每个新的 `(seq_len, mask)` 组合 JIT 编译一个形状专用 kernel，其 plan/workspace 显存**不在 PyTorch caching allocator 内**，`expandable_segments` / `empty_cache()` 都回收不了；训练时文本长度可变、序列又长（1024 分辨率约 4096 图像 token），于是把显存顶爆。注意 PyTorch 从 2.6 起已把 cuDNN SDPA 改为 opt-in（默认排在最后），这里是移植参考实现时被手动排到了第一位。
+
+**修复**（`extensions_built_in/diffusion_models/krea2/src/mmdit.py`）：
+
+1. SDPA 优先级列表去掉 `CUDNN_ATTENTION`，改为 `FLASH_ATTENTION → EFFICIENT_ATTENTION → MATH`。flash 遇到非空 `attn_mask` 时会自动退回 mem-efficient，不会再走 cuDNN。
+2. 序列对齐到 256 的 padding 只在 `torch.compiler.is_compiling()` 时执行。eager 模式下它只会追加被 mask 掉的 token，反而让 flash 无法启用（本机 `compile: false`，所以此前一直在做无用 padding）。
+3. 仅当确实存在被 mask 的位置时才构造 `(B,1,L,L)` mask；`batch_size: 1` + eager 时全是有效 token，直接传 `attn_mask=None`，从而真正走 flash。
+
+**预期收益**：消除 cuDNN JIT 导致的 OOM。注意力在 Krea2 计算量中约占 10%，端到端提速预计 0~3%（当前 ~20.6s/it 的瓶颈更可能是分层卸载的搬运开销，而非注意力）。
+
+**无需新增依赖**，使用 PyTorch 内置的 FA2（48 头 / 12 KV 头 GQA、head_dim 128、bf16 均支持）。回退方式：`git revert` 本次提交即可。

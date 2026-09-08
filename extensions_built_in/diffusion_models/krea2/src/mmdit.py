@@ -9,8 +9,11 @@ velocity on the image tokens.
 Differences from the reference (all training-driven, numerically equivalent):
   - ``torch.compile`` decorators are dropped (they fight gradient checkpointing,
     LoRA module swapping and variable shapes during training).
-  - Attention uses a plain ``F.scaled_dot_product_attention`` instead of forcing
-    the cuDNN SDPA backend, so it works across dtypes / masks / backward.
+  - Attention runs through ``F.scaled_dot_product_attention`` with flash
+    attention (FA2) first and the memory-efficient kernel as fallback. cuDNN
+    SDPA is intentionally skipped: its per-shape JIT needs device memory
+    outside PyTorch's caching allocator and OOMs on long variable-length
+    training shapes.
   - ``enable_gradient_checkpointing`` / ``disable_gradient_checkpointing`` and a
     per-block ``torch.utils.checkpoint`` wrapper are added (gated on
     ``torch.is_grad_enabled()`` so eval/sampling never pays for it).
@@ -58,15 +61,19 @@ def attention(
     scale: float | None = None,
     gqa: bool = False,
 ) -> Tensor:
-    # cuDNN attention is NVIDIA-only, so hardcoding SDPBackend.CUDNN_ATTENTION
-    # raises "No available kernel" on non-NVIDIA backends (AMD ROCm, Intel XPU,
-    # Apple MPS). Pass a priority list instead: cuDNN is still preferred on
-    # NVIDIA, and the dispatcher falls back to flash/efficient/math elsewhere.
+    # FlashAttention-2 first: it is a fused kernel that never materializes the
+    # L x L score matrix and supports GQA natively. cuDNN SDPA is deliberately
+    # NOT in the list -- it JIT-compiles a shape-specialized kernel per new
+    # (seq_len, mask) combination and that plan/workspace lives *outside*
+    # PyTorch's caching allocator, which OOMs on long variable-length training
+    # shapes ("CUDNN_STATUS_EXECUTION_FAILED_CUDA_DRIVER ... CUDA ran out of
+    # memory outside PyTorch's allocator"). The dispatcher falls back to the
+    # memory-efficient (xformers-style) kernel when flash cannot run (e.g. a
+    # non-null attn_mask), then to math.
     # (On ROCm gfx11xx the flash path needs
     # TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1; masked attention uses math.)
     with sdpa_kernel(
         [
-            SDPBackend.CUDNN_ATTENTION,
             SDPBackend.FLASH_ATTENTION,
             SDPBackend.EFFICIENT_ATTENTION,
             SDPBackend.MATH,
@@ -515,13 +522,16 @@ class SingleStreamDiT(nn.Module, OstrisModelMixin):
         txtlen, imglen = context.shape[1], img.shape[1]
         combined = torch.cat((context, img), dim=1)
 
-        # Pad combined sequence to a multiple of 256 to stabilize compiled kernel shapes.
-        fulllen = combined.shape[1]
-        _padlen = (-fulllen) % 256
-        if _padlen > 0:
-            combined = F.pad(combined, (0, 0, 0, _padlen))
-            mask = F.pad(mask, (0, _padlen), value=False)
-            pos = F.pad(pos, (0, 0, 0, _padlen))
+        # Pad the combined sequence to a multiple of 256 only while torch.compile
+        # is tracing (shape stability). In eager mode the pad is pure overhead:
+        # it appends masked-out tokens, which forces a non-null attn_mask and
+        # therefore disqualifies the flash SDPA kernel.
+        if torch.compiler.is_compiling():
+            _padlen = (-combined.shape[1]) % 256
+            if _padlen > 0:
+                combined = F.pad(combined, (0, 0, 0, _padlen))
+                mask = F.pad(mask, (0, _padlen), value=False)
+                pos = F.pad(pos, (0, 0, 0, _padlen))
 
         blockvec = tvec
         if reflen > 0:
@@ -540,8 +550,17 @@ class SingleStreamDiT(nn.Module, OstrisModelMixin):
             )
             blockvec = (tvec, self.tproj(t0), txtlen + imglen - reflen)
 
-        padmask = mask  # (B, L) key-padding mask, incl. the 256-alignment pad
-        mask = _mask(mask)
+        padmask = mask  # (B, L) key-padding mask (compile pad / ref padding)
+        # Flash SDPA rejects any non-null attn_mask, so only build the
+        # (B, 1, L, L) mask when something is actually masked out. With
+        # batch_size 1 in eager mode every position is real and the mask is
+        # dropped entirely, which lets the flash kernel run.
+        need_mask = (
+            ref_kv_cache is not None
+            or (reflen > 0 and isolate_refs)
+            or not bool(padmask.all())
+        )
+        mask = _mask(padmask) if need_mask else None
 
         if reflen > 0 and isolate_refs:
             # Asymmetric attention (OminiControl2-style "feature reuse"): ref
